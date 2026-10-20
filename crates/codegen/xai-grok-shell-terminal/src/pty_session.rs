@@ -58,6 +58,8 @@ const EXIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 const REAP_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 
 pub struct PtySession {
+    /// ConPTY master, when the OS has one. A pipe shell leaves this empty:
+    /// there is no console to resize or hang up.
     master: Option<Box<dyn MasterPty + Send>>,
     /// Taken at teardown so the writer loop ends and releases its master dup.
     input_tx: Option<mpsc::Sender<Vec<u8>>>,
@@ -236,6 +238,58 @@ pub(crate) async fn require_pty(
         })
 }
 
+struct OpenedShell {
+    master: Option<Box<dyn MasterPty + Send>>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+}
+
+/// Open a shell the session can read and write.
+///
+/// `portable-pty` panics when `CreatePseudoConsole` is missing, which it is on
+/// XP. That path is not called here. The replacement is a pipe and
+/// `CreateProcess`: `cmd` runs, and it is not a console, so resize is a stored
+/// size only and full-screen console programs do not work.
+fn open_session_shell(cmd: CommandBuilder, size: PtySize) -> Result<OpenedShell, TerminalExtError> {
+    #[cfg(windows)]
+    if !crate::pipe_pty::conpty_available() {
+        let ends = crate::pipe_pty::spawn_shell(cmd).map_err(|error| {
+            TerminalExtError::Internal(format!("failed to spawn pipe shell: {error}"))
+        })?;
+        return Ok(OpenedShell {
+            master: None,
+            child: ends.child,
+            reader: ends.reader,
+            writer: ends.writer,
+        });
+    }
+
+    let pair = native_pty_system()
+        .openpty(size)
+        .map_err(|e| TerminalExtError::Internal(format!("failed to open pty: {e}")))?;
+    // The child is enrolled below, and the guard reaps it until it reaches the registry
+    #[allow(clippy::disallowed_methods)]
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| TerminalExtError::Internal(format!("failed to spawn shell: {e}")))?;
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| TerminalExtError::Internal(format!("failed to clone pty reader: {e}")))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| TerminalExtError::Internal(format!("failed to take pty writer: {e}")))?;
+    Ok(OpenedShell {
+        master: Some(pair.master),
+        child,
+        reader,
+        writer,
+    })
+}
+
 pub async fn create_pty(
     shell: Option<&str>,
     cwd: Option<&str>,
@@ -248,17 +302,12 @@ pub async fn create_pty(
 ) -> Result<String, TerminalExtError> {
     let pty_id = uuid::Uuid::now_v7().to_string();
 
-    let pty_system = native_pty_system();
     let size = PtySize {
         rows,
         cols,
         pixel_width: 0,
         pixel_height: 0,
     };
-
-    let pair = pty_system
-        .openpty(size)
-        .map_err(|e| TerminalExtError::Internal(format!("failed to open pty: {e}")))?;
 
     let (shell_path, shell_args) = resolve_pty_shell(shell);
 
@@ -281,14 +330,12 @@ pub async fn create_pty(
     cmd.env("LANG", "en_US.UTF-8");
     cmd.env("LC_ALL", "en_US.UTF-8");
 
-    // The child is enrolled below, and the guard reaps it until it reaches the registry
-    #[allow(clippy::disallowed_methods)]
-    let child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| TerminalExtError::Internal(format!("failed to spawn shell: {e}")))?;
+    let opened = open_session_shell(cmd, size)?;
+    let reader = opened.reader;
+    let writer = opened.writer;
+    let master = opened.master;
 
-    let mut shell = UnregisteredShell::new(child);
+    let mut shell = UnregisteredShell::new(opened.child);
     if let Some(pid) = shell.pid() {
         // `enroll_terminal_pid` reaps with a grace wait if it loses the close race, so run it off-task
         let enrolled = tokio::task::spawn_blocking(move || {
@@ -299,15 +346,6 @@ pub async fn create_pty(
         .map_err(|e| TerminalExtError::Internal(format!("failed to enroll shell: {e}")))?;
         shell.attach_group(enrolled);
     }
-
-    let reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| TerminalExtError::Internal(format!("failed to clone pty reader: {e}")))?;
-    let writer = pair
-        .master
-        .take_writer()
-        .map_err(|e| TerminalExtError::Internal(format!("failed to take pty writer: {e}")))?;
 
     let (input_tx, input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
     spawn_pty_input_loop(writer, input_rx);
@@ -350,7 +388,7 @@ pub async fn create_pty(
     }
 
     let entry = Arc::new(Mutex::new(PtySession {
-        master: Some(pair.master),
+        master,
         input_tx: Some(input_tx),
         output_offset: 0,
         output_ring: VecDeque::with_capacity(OUTPUT_RING_BUFFER_SIZE),
@@ -371,6 +409,15 @@ pub async fn create_pty(
     tokio::task::spawn_local(run_pty_output_loop(reader, entry, pty_id_clone, gateway));
 
     Ok(pty_id)
+}
+
+/// Run `echo xp-shell` through the pipe shell and return the child's output.
+///
+/// `GROK_PIPE_SHELL_PROBE` calls this before the TUI starts. It is the bounded
+/// check that spawn, job enrollment, and the stdio pipes work on XP.
+#[cfg(windows)]
+pub fn run_pipe_shell_probe() -> std::io::Result<Vec<u8>> {
+    crate::pipe_pty::run_probe()
 }
 
 fn spawn_pty_input_loop(mut writer: Box<dyn Write + Send>, mut input_rx: mpsc::Receiver<Vec<u8>>) {
@@ -610,17 +657,18 @@ pub async fn write_pty_input(pty_id: &str, data: &[u8]) -> Result<(), TerminalEx
 pub async fn resize_pty(pty_id: &str, rows: u16, cols: u16) -> Result<(), TerminalExtError> {
     let entry = require_pty(pty_id).await?;
     let mut session = entry.lock().await;
-    let Some(master) = session.master.as_ref() else {
-        return Ok(());
-    };
-    master
-        .resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| TerminalExtError::Internal(format!("failed to resize pty: {e}")))?;
+    // ConPTY tells the console. A pipe has no console: the stored size is only
+    // what the client asked for, and the child is not signaled.
+    if let Some(master) = session.master.as_ref() {
+        master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| TerminalExtError::Internal(format!("failed to resize pty: {e}")))?;
+    }
     session.rows = rows;
     session.cols = cols;
     Ok(())

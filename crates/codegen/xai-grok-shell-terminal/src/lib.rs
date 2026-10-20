@@ -29,6 +29,9 @@ mod output_recorder;
 
 pub mod pty_session;
 
+#[cfg(windows)]
+mod pipe_pty;
+
 mod streaming_local_terminal;
 pub use streaming_local_terminal::{
     ExitStatus, GatedNotifier, KillOutcome, OutputSnapshot, SessionNotificationSender,

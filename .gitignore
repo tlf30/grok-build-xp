@@ -1,3 +1,29 @@
 /target
 **/*.rs.bk
 .DS_Store
+
+# Windows reserved-name files created by a bad redirect.
+NUL
+
+# Host linker object left at the repo root.
+/xp-link.obj
+
+# Lab notes and the machine-specific install test. They stay on disk.
+/XP-TEST-MACHINE.md
+/xp-port/installer/test-on-xp.ps1
+
+# Installer build outputs.
+/xp-port/installer/dist/
+/xp-port/installer/obj-*/
+/xp-port/installer/*.exe
+/xp-port/installer/*.pdb
+/xp-port/installer/*.obj
+/xp-port/installer/*.ilk
+/xp-port/installer/*.exp
+/xp-port/installer/*.lib
+/xp-port/installer/*.res
+
+# Visual Studio local files.
+.vs/
+*.user
+*.suo

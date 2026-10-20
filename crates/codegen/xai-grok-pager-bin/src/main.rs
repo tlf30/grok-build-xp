@@ -2034,6 +2034,23 @@ fn dispatch_doctor_if_requested(args: &PagerArgs) -> bool {
     true
 }
 fn main() {
+    // XP has no ConPTY. This runs one pipe-shell command and exits before the
+    // TUI, so a service capture can prove the shell without waiting on a prompt.
+    #[cfg(windows)]
+    if std::env::var_os("GROK_PIPE_SHELL_PROBE").is_some() {
+        match xai_grok_shell::terminal::pty_session::run_pipe_shell_probe() {
+            Ok(output) => {
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(&output);
+                let _ = stdout.flush();
+                std::process::exit(0);
+            }
+            Err(error) => {
+                eprintln!("pipe-shell: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     xai_grok_version::set_full_version(env!("VERSION_WITH_COMMIT"));
     xai_grok_telemetry::startup::mark_process_start();
     if let Some(code) = xai_grok_pager::app::mermaid_worker::maybe_run_render_subprocess() {

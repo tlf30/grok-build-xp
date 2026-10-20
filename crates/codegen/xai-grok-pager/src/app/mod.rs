@@ -1335,7 +1335,6 @@ fn configure_windows_console() {
         fn SetConsoleOutputCP(wCodePageID: u32) -> i32;
     }
     unsafe {
-        SetConsoleOutputCP(CP_UTF8);
         let handle = GetStdHandle(STD_ERROR_HANDLE);
         if handle.is_null() || handle == -1_isize as *mut _ {
             return;
@@ -1344,10 +1343,17 @@ fn configure_windows_console() {
         if GetConsoleMode(handle, &mut mode) == 0 {
             return;
         }
-        let _ = SetConsoleMode(
+        // Code page 65001 is only useful for the byte-oriented VT path (the braille
+        // logo is written as UTF-8 bytes there). XP rejects the VT mode bit and has
+        // no console font for 65001: setting it drops Lucida Console and leaves the
+        // raster font unable to map glyphs. WriteConsoleW does not need that code page.
+        if SetConsoleMode(
             handle,
             mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-        );
+        ) != 0
+        {
+            SetConsoleOutputCP(CP_UTF8);
+        }
     }
 }
 /// crossterm's `EnableMouseCapture` is winapi-only on Windows (`is_ansi_code_supported() == false`).
@@ -1544,12 +1550,15 @@ fn init_terminal(
             } else if crate::terminal::terminal_context().mouse_reporting_leaks_as_raw_text() {
                 let _ = stderr.write_all(xai_crash_handler::terminal::MOUSE_TRACKING_RESET);
             }
-            execute!(
-                stderr,
-                event::EnableFocusChange,
-                event::EnableBracketedPaste,
-                cursor::Hide,
-            )?;
+            execute!(stderr, event::EnableFocusChange)?;
+            // XP and Windows 7 have no bracketed-paste console API. Crossterm
+            // returns Unsupported, and paste still arrives as separate keys.
+            if let Err(error) = execute!(stderr, event::EnableBracketedPaste) {
+                if error.kind() != io::ErrorKind::Unsupported {
+                    return Err(error);
+                }
+            }
+            execute!(stderr, cursor::Hide)?;
             let policy = cursor_style_policy(cursor_blink);
             match policy {
                 CursorStylePolicy::Inherit => {}
